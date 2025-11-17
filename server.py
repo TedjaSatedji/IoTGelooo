@@ -20,11 +20,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 ONLINE_THRESHOLD_SECONDS = 20  # Device is considered online if seen within this many seconds
 
 IMPORTANT_EVENTS = {
-    "Movement Detected",
+    "Gerakan Terdeteksi",   # movement
+    "Posisi Diminta",       # request position
     "System Armed",
     "System Disarmed",
     "Theft Warning",
-    "Request Position",
 }
 
 # =========================
