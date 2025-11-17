@@ -5,22 +5,36 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 
+// ====== CONFIG ======
 const char* ssid     = "snailshouse";
 const char* password = "chiffons";
 
-// ganti dengan IP PC kamu
-const char* baseUrl = "http://10.116.165.183:8000";
+// Change this to your PC's IP running FastAPI
+const char* serverBase = "http://10.13.108.183:8000";
 
-const int buttonPin = 4;
-const int buzzerPin = 26;
+// Must match device_id used in backend
+String deviceId = "DEV024";
 
-String deviceId = "MOTOR-ABC123";
+// Pins
+const int buttonPin = 4;   // simulate motion (active LOW)
+const int buzzerPin = 5;   // active buzzer
 
+// GPS on Serial1 (adjust pins)
+const int gpsRxPin = 16;   // ESP32 RX <-- GPS TX
+const int gpsTxPin = 17;   // ESP32 TX --> GPS RX (often unused)
+
+// Timing
+unsigned long lastCommandCheck = 0;
+const unsigned long commandInterval = 2000; // ms
+
+unsigned long lastHeartbeat = 0;
+const unsigned long heartbeatInterval = 15000; // ms
+
+bool isArmed = true;
+
+// GPS
 HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
-
-unsigned long lastCommandCheck = 0;
-const unsigned long commandInterval = 2000; // 2s
 
 void beepBuzzer(int times, int onMs, int offMs) {
   for (int i = 0; i < times; i++) {
@@ -35,25 +49,23 @@ void longAlarm() {
   beepBuzzer(5, 200, 100);
 }
 
-void sendAlert(const char* status) {
+void sendAlert(const String& status) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, cannot send alert");
+    Serial.println("[ALERT] WiFi not connected, cannot send");
     return;
   }
 
-  String latField;
-  String lonField;
+  double lat = 0;
+  double lon = 0;
 
   if (gps.location.isValid()) {
-    latField = String(gps.location.lat(), 6);
-    lonField = String(gps.location.lng(), 6);
+    lat = gps.location.lat();
+    lon = gps.location.lng();
   } else {
-    Serial.println("GPS not valid, sending \"invalid\"");
-    latField = String("\"invalid\"");
-    lonField = String("\"invalid\"");
+    Serial.println("[ALERT] GPS not valid, sending lat=0, lon=0");
   }
 
-  String url = String(baseUrl) + "/api/alert";
+  String url = String(serverBase) + "/api/alert";
 
   HTTPClient http;
   http.begin(url);
@@ -61,93 +73,153 @@ void sendAlert(const char* status) {
 
   String payload = "{";
   payload += "\"device_id\":\"" + deviceId + "\",";
-  payload += "\"status\":\"" + String(status) + "\",";
-  payload += "\"lat\":" + latField + ",";
-  payload += "\"lon\":" + lonField;
+  payload += "\"status\":\"" + status + "\",";
+  payload += "\"lat\":" + String(lat, 6) + ",";
+  payload += "\"lon\":" + String(lon, 6);
   payload += "}";
 
-  Serial.println("Sending alert: " + payload);
+  Serial.print("[ALERT] Sending payload: ");
+  Serial.println(payload);
 
   int code = http.POST(payload);
-  Serial.print("HTTP code: ");
+  Serial.print("[ALERT] HTTP status: ");
   Serial.println(code);
 
   if (code > 0) {
     String resp = http.getString();
-    Serial.println("Response: " + resp);
+    Serial.print("[ALERT] Response: ");
+    Serial.println(resp);
   }
+
   http.end();
 }
 
 void checkCommands() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED) return;
 
   unsigned long now = millis();
-  if (now - lastCommandCheck < commandInterval) {
-    return;
-  }
+  if (now - lastCommandCheck < commandInterval) return;
   lastCommandCheck = now;
 
-  String url = String(baseUrl) + "/api/commands/" + deviceId;
+  String url = String(serverBase) + "/api/commands/" + deviceId;
+
   HTTPClient http;
   http.begin(url);
   int code = http.GET();
 
   if (code == 200) {
     String resp = http.getString();
-    Serial.println("Command response: " + resp);
+    Serial.print("[CMD] Response: ");
+    Serial.println(resp);
 
-    // simple manual parse (cheap way)
     if (resp.indexOf("\"command\":\"BUZZ\"") >= 0) {
-      Serial.println("Executing BUZZ command");
+      Serial.println("[CMD] BUZZ received");
       longAlarm();
-    } else if (resp.indexOf("\"command\":\"SILENT\"") >= 0) {
-      Serial.println("Received SILENT command (no action)");
+      sendAlert("BUZZ Executed");
+
+    } else if (resp.indexOf("\"command\":\"ARM\"") >= 0) {
+      Serial.println("[CMD] ARM received");
+      isArmed = true;
+      sendAlert("System Armed");
+
+    } else if (resp.indexOf("\"command\":\"DISARM\"") >= 0) {
+      Serial.println("[CMD] DISARM received");
+      isArmed = false;
+      sendAlert("System Disarmed");
+
+    } else if (resp.indexOf("\"command\":\"REQUEST_POSITION\"") >= 0) {
+      Serial.println("[CMD] REQUEST_POSITION received");
+      sendAlert("Posisi Diminta");
+
+    } else if (resp.indexOf("\"command\":") >= 0 &&
+               resp.indexOf("\"command\":\"null\"") == -1 &&
+               resp.indexOf("\"command\": null") == -1) {
+      Serial.println("[CMD] Custom command received");
+      sendAlert("Custom Command Executed");
     }
+
   } else {
-    Serial.print("Command GET failed, code=");
+    Serial.print("[CMD] GET failed, code=");
     Serial.println(code);
   }
 
   http.end();
 }
 
+void maybeSendHeartbeat() {
+  unsigned long now = millis();
+  if (now - lastHeartbeat < heartbeatInterval) return;
+  lastHeartbeat = now;
+
+  Serial.println("[HEARTBEAT] Sending heartbeat");
+  sendAlert("Heartbeat");
+}
+
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n[BOOT] ESP32 Anti-Theft Tracker");
 
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
 
-  gpsSerial.begin(115200, SERIAL_8N1, 16, 17); // RX, TX ke GPS
+  gpsSerial.begin(9600, SERIAL_8N1, gpsRxPin, gpsTxPin);
+  Serial.println("[BOOT] GPS serial started");
 
+  Serial.print("[BOOT] Connecting to WiFi: ");
+  Serial.println(ssid);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
-  Serial.print("ESP IP: ");
+  Serial.println("\n[BOOT] WiFi connected");
+  Serial.print("[BOOT] ESP IP: ");
   Serial.println(WiFi.localIP());
+
+  sendAlert("Device Booted");
 }
 
 void loop() {
-  // keep feeding GPS parser
   while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
+    char c = gpsSerial.read();
+    gps.encode(c);
   }
 
-  // button pressed = simulate movement detected
+  static unsigned long lastGpsPrint = 0;
+  unsigned long now = millis();
+  if (now - lastGpsPrint > 2000) {
+    lastGpsPrint = now;
+    if (gps.location.isValid()) {
+      Serial.print("[GPS] Lat: ");
+      Serial.print(gps.location.lat(), 6);
+      Serial.print(" Lon: ");
+      Serial.print(gps.location.lng(), 6);
+      Serial.print(" Sat: ");
+      Serial.print(gps.satellites.value());
+      Serial.print(" HDOP: ");
+      Serial.println(gps.hdop.value());
+    } else {
+      Serial.println("[GPS] No valid fix yet");
+    }
+  }
+
   if (digitalRead(buttonPin) == LOW) {
-    Serial.println("Button pressed -> movement detected");
-    longAlarm();                     // local alarm
-    sendAlert("Gerakan Terdeteksi"); // send to server
-    delay(1000);                     // debouncing / anti-spam
+    Serial.println("[EVENT] Button pressed -> movement detected");
+
+    if (isArmed) {
+      Serial.println("[EVENT] System armed -> triggering alarm + alert");
+      longAlarm();
+      sendAlert("Gerakan Terdeteksi");
+    } else {
+      Serial.println("[EVENT] System disarmed -> ignoring movement");
+    }
+
+    delay(700);
   }
 
-  // poll server for commands
   checkCommands();
+  maybeSendHeartbeat();
 }
