@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Optional, List
 import uuid
 import hashlib
+import json
+import paho.mqtt.client as mqtt
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float,
@@ -26,6 +28,12 @@ IMPORTANT_EVENTS = {
     "System Disarmed",
     "Theft Warning",
 }
+
+MQTT_BROKER = "localhost"          # or your broker IP, e.g. "127.0.0.1"
+MQTT_PORT = 1883
+MQTT_BASE_TOPIC = "motor"
+
+mqtt_client = mqtt.Client()
 
 # =========================
 # Database setup
@@ -190,6 +198,26 @@ app = FastAPI(
     title="Motor Anti-Theft Backend",
     description="Prototype backend with DB, simple auth, device registration, and debug dashboard",
 )
+
+
+@app.on_event("startup")
+def on_startup():
+    try:
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()  # Start background thread for MQTT
+        print("[MQTT] Connected to broker")
+    except Exception as e:
+        print("[MQTT] Failed to connect at startup:", e)
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    try:
+        mqtt_client.loop_stop()  # Stop background thread
+        mqtt_client.disconnect()
+        print("[MQTT] Disconnected from broker")
+    except Exception as e:
+        print("[MQTT] Failed to disconnect:", e)
 
 
 # =========================
@@ -410,14 +438,28 @@ def send_command(device_id: str, cmd: CommandIn, db: Session = Depends(get_db)):
     if not device:
         raise HTTPException(status_code=404, detail="Unknown device")
 
-    PENDING_COMMANDS[device_id] = {
+    topic = f"{MQTT_BASE_TOPIC}/{device_id}/cmd"
+    payload = {
         "command": cmd.command,
         "value": cmd.value,
-        "queued_at": datetime.utcnow().isoformat(),
     }
+    try:
+        result = mqtt_client.publish(topic, json.dumps(payload), qos=1)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise HTTPException(
+                status_code=500,
+                detail=f"MQTT publish failed with code {result.rc}",
+            )
+    except Exception as e:
+        print("[MQTT] Publish error:", e)
+        raise HTTPException(status_code=500, detail="Failed to publish MQTT command")
 
-    print(f"COMMAND QUEUED for {device_id}: {PENDING_COMMANDS[device_id]}")
-    return {"ok": True, "device_id": device_id, "pending": PENDING_COMMANDS[device_id]}
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "topic": topic,
+        "payload": payload,
+    }
 
 
 @app.get("/api/commands/{device_id}")

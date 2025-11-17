@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
+#include <PubSubClient.h>   // MQTT library
 
 // ====== MIDI NOTES ======
 #define ARRAY_LEN(array) (sizeof(array) / sizeof(array[0]))
@@ -51,6 +52,15 @@ const char* ssid     = "snailshouse";
 const char* password = "chiffons";
 const char* serverBase = "http://139.59.119.186:8000";
 String deviceId = "DEV024";
+
+// MQTT config
+const char* mqttServer = "139.59.119.186";   // same VPS or wherever Mosquitto is
+const int   mqttPort   = 1883;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+String mqttCmdTopic;  // will be "motor/<deviceId>/cmd"
 
 // Pins
 const int buttonPin = 4;
@@ -167,57 +177,76 @@ void sendAlert(const String& status) {
   http.end();
 }
 
-// [NEW] This function is now ONLY called by the network task on Core 0
-void checkCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
+// [MQTT] Handle command string from MQTT payload
+void handleCommandString(const String &resp) {
+  // This is basically the old checkCommands() logic,
+  // but "resp" now comes from MQTT payload instead of HTTP.
 
-  String url = String(serverBase) + "/api/commands/" + deviceId;
-  HTTPClient http;
-  http.begin(url);
-
-  // [BLOCKING] This GET call now blocks Core 0, which is fine!
-  int code = http.GET();
-
-  if (code == 200) {
-    String resp = http.getString();
-    Serial.print("[CMD] Response: ");
-    Serial.println(resp);
-
-    // We use the mutex to safely change the 'isArmed' variable
-    if (resp.indexOf("\"command\":\"ARM\"") >= 0) {
-      Serial.println("[CMD] ARM received");
-      // [NEW] Safely write to the shared variable
-      if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-        isArmed = true;
-        xSemaphoreGive(armMutex);
-      }
-      sendAlert("System Armed"); // This is fine, we are on Core 0
-
-    } else if (resp.indexOf("\"command\":\"DISARM\"") >= 0) {
-      Serial.println("[CMD] DISARM received");
-      // [NEW] Safely write to the shared variable
-      if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-        isArmed = false;
-        xSemaphoreGive(armMutex);
-      }
-      sendAlert("System Disarmed");
-
-    } else if (resp.indexOf("\"command\":\"BUZZ\"") >= 0) {
-      Serial.println("[CMD] BUZZ received");
-      longAlarm(); // This is fine, it uses the buzzer mutex
-      sendAlert("BUZZ Executed");
-
-    } else if (resp.indexOf("\"command\":\"REQUEST_POSITION\"") >= 0) {
-      Serial.println("[CMD] REQUEST_POSITION received");
-      sendAlert("Posisi Diminta");
+  if (resp.indexOf("\"command\":\"ARM\"") >= 0) {
+    Serial.println("[MQTT] ARM received");
+    if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
+      isArmed = true;
+      xSemaphoreGive(armMutex);
     }
-    // [FIXED] No more "custom command" bug
+    sendAlert("System Armed");
 
-  } else {
-    Serial.print("[CMD] GET failed, code=");
-    Serial.println(code);
+  } else if (resp.indexOf("\"command\":\"DISARM\"") >= 0) {
+    Serial.println("[MQTT] DISARM received");
+    if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
+      isArmed = false;
+      xSemaphoreGive(armMutex);
+    }
+    sendAlert("System Disarmed");
+
+  } else if (resp.indexOf("\"command\":\"BUZZ\"") >= 0) {
+    Serial.println("[MQTT] BUZZ received");
+    longAlarm();
+    sendAlert("BUZZ Executed");
+
+  } else if (resp.indexOf("\"command\":\"REQUEST_POSITION\"") >= 0) {
+    Serial.println("[MQTT] REQUEST_POSITION received");
+    sendAlert("Posisi Diminta");
   }
-  http.end();
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("[MQTT] Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  Serial.println(msg);
+
+  // Only handle our command topic, just in case
+  if (String(topic) == mqttCmdTopic) {
+    handleCommandString(msg);
+  }
+}
+
+void mqttReconnect() {
+  // Loop until reconnected
+  while (!mqttClient.connected()) {
+    Serial.print("[MQTT] Attempting connection...");
+    // Client ID can be anything unique
+    String clientId = "motor-esp32-";
+    clientId += deviceId;
+
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("connected");
+      // Subscribe to command topic
+      mqttClient.subscribe(mqttCmdTopic.c_str());
+      Serial.print("[MQTT] Subscribed to ");
+      Serial.println(mqttCmdTopic);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 5 seconds");
+      vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+  }
 }
 
 
@@ -225,9 +254,7 @@ void checkCommands() {
 void networkTask(void *pvParameters) {
   Serial.println("[TASK] Network task started on Core 0");
 
-  unsigned long lastCommandCheck = 0;
   unsigned long lastHeartbeat = 0;
-  const unsigned long commandInterval = 3000;
   const unsigned long heartbeatInterval = 15000;
 
   // This is the infinite loop for Core 0
@@ -240,6 +267,12 @@ void networkTask(void *pvParameters) {
       continue; // Skip the rest of the loop
     }
 
+    // Ensure MQTT is connected
+    if (!mqttClient.connected()) {
+      mqttReconnect();
+    }
+    mqttClient.loop();  // process incoming MQTT packets
+
     // 2. Check for alerts from the queue
     AlertMessage alertMessage;
     // [NEW] Check the queue. '0' timeout means it returns instantly
@@ -251,13 +284,7 @@ void networkTask(void *pvParameters) {
 
     unsigned long now = millis();
 
-    // 3. Check for commands (non-blocking timer)
-    if (now - lastCommandCheck >= commandInterval) {
-      lastCommandCheck = now;
-      checkCommands(); // This is a blocking call on Core 0
-    }
-
-    // 4. Send heartbeat (non-blocking timer)
+    // 3. Send heartbeat (non-blocking timer)
     if (now - lastHeartbeat >= heartbeatInterval) {
       lastHeartbeat = now;
       Serial.println("[TASK] Queuing heartbeat");
@@ -307,6 +334,12 @@ void setup() {
   Serial.println("\n[BOOT] WiFi connected");
   Serial.print("[BOOT] ESP IP: ");
   Serial.println(WiFi.localIP());
+
+  // [MQTT] Initialize MQTT
+  mqttCmdTopic = "motor/" + deviceId + "/cmd";
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  Serial.println("[BOOT] MQTT configured");
 
   // [NEW] Send the boot message to the queue
   AlertMessage bootMsg;
@@ -385,9 +418,8 @@ void loop() {
   }
 
   // [REMOVED]
-  // checkCommands();
-  // maybeSendHeartbeat();
-  // All networking is now on Core 0!
+  // All networking (HTTP alerts + MQTT commands) is now on Core 0!
+  // No more HTTP polling for commands - everything comes via MQTT
   
   // This loop now finishes in microseconds.
 }
