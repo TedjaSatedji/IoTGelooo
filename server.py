@@ -19,6 +19,14 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 
 ONLINE_THRESHOLD_SECONDS = 20  # Device is considered online if seen within this many seconds
 
+IMPORTANT_EVENTS = {
+    "Movement Detected",
+    "System Armed",
+    "System Disarmed",
+    "Theft Warning",
+    "Request Position",
+}
+
 # =========================
 # Database setup
 # =========================
@@ -52,6 +60,9 @@ class Device(Base):
     name = Column(String, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     last_seen = Column(DateTime, nullable=True)
+    last_status = Column(String, nullable=True)
+    last_lat = Column(Float, nullable=True)
+    last_lon = Column(Float, nullable=True)
 
     owner = relationship("User", back_populates="devices")
     alerts = relationship("Alert", back_populates="device")
@@ -327,38 +338,44 @@ def receive_alert(payload: AlertIn, db: Session = Depends(get_db)):
             id=payload.device_id,
             name=f"Unregistered device {payload.device_id}",
             user_id=None,
-            last_seen=datetime.utcnow()
         )
         db.add(device)
+
+    # Always update current state
+    device.last_seen = datetime.utcnow()
+    device.last_status = payload.status
+    device.last_lat = payload.lat
+    device.last_lon = payload.lon
+
+    # Only store meaningful events
+    alert_id = None
+    if payload.status in IMPORTANT_EVENTS:
+        alert = Alert(
+            device_id=device.id,
+            status=payload.status,
+            lat=payload.lat,
+            lon=payload.lon,
+            created_at=datetime.utcnow(),
+        )
+        db.add(alert)
         db.commit()
-        db.refresh(device)
+        db.refresh(alert)
+        alert_id = alert.id
+
+        print("IMPORTANT EVENT:", {
+            "device_id": alert.device_id,
+            "status": alert.status,
+            "lat": alert.lat,
+            "lon": alert.lon,
+            "created_at": alert.created_at.isoformat(),
+        })
     else:
-        device.last_seen = datetime.utcnow()
         db.commit()
-
-    alert = Alert(
-        device_id=device.id,
-        status=payload.status,
-        lat=payload.lat,
-        lon=payload.lon,
-        created_at=datetime.utcnow(),
-    )
-    db.add(alert)
-    db.commit()
-    db.refresh(alert)
-
-    print("NEW ALERT:", {
-        "device_id": alert.device_id,
-        "status": alert.status,
-        "lat": alert.lat,
-        "lon": alert.lon,
-        "created_at": alert.created_at.isoformat(),
-    })
 
     if device.id not in PENDING_COMMANDS:
         PENDING_COMMANDS[device.id] = None
 
-    return {"ok": True, "alert_id": alert.id}
+    return {"ok": True, "alert_id": alert_id}
 
 
 @app.get("/api/devices/{device_id}/alerts", response_model=List[AlertOut])
@@ -431,6 +448,35 @@ def device_status(device_id: str, db: Session = Depends(get_db)):
         "online": online,
         "seconds_since_seen": diff,
         "last_seen": device.last_seen.isoformat(),
+    }
+
+
+@app.get("/devices/{device_id}/current")
+def current_status(device_id: str, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if not device.last_seen:
+        return {
+            "device_id": device.id,
+            "online": False,
+            "seconds_since_seen": None,
+            "last_status": None,
+            "lat": None,
+            "lon": None,
+        }
+
+    diff = (datetime.utcnow() - device.last_seen).total_seconds()
+    online = diff < ONLINE_THRESHOLD_SECONDS
+
+    return {
+        "device_id": device.id,
+        "online": online,
+        "seconds_since_seen": diff,
+        "last_status": device.last_status,
+        "lat": device.last_lat,
+        "lon": device.last_lon,
     }
 
 

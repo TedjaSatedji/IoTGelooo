@@ -10,7 +10,7 @@ const char* ssid     = "snailshouse";
 const char* password = "chiffons";
 
 // Change this to your PC's IP running FastAPI
-const char* serverBase = "http://10.13.108.183:8000";
+const char* serverBase = "http://139.59.119.186:8000";
 
 // Must match device_id used in backend
 String deviceId = "DEV024";
