@@ -4,6 +4,7 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <PubSubClient.h>   // MQTT library
+#include <ArduinoJson.h>
 
 // ====== MIDI NOTES ======
 #define ARRAY_LEN(array) (sizeof(array) / sizeof(array[0]))
@@ -179,33 +180,55 @@ void sendAlert(const String& status) {
 
 // [MQTT] Handle command string from MQTT payload
 void handleCommandString(const String &resp) {
-  // This is basically the old checkCommands() logic,
-  // but "resp" now comes from MQTT payload instead of HTTP.
+  Serial.print("[MQTT] Parsing command: ");
+  Serial.println(resp);
 
-  if (resp.indexOf("\"command\":\"ARM\"") >= 0) {
-    Serial.println("[MQTT] ARM received");
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print("[MQTT] JSON parse failed: ");
+    Serial.println(err.f_str());
+    return;
+  }
+
+  const char* command = doc["command"];
+  if (!command) {
+    Serial.println("[MQTT] No 'command' field");
+    return;
+  }
+
+  String cmd = String(command);
+  Serial.print("[MQTT] Command parsed: ");
+  Serial.println(cmd);
+
+  if (cmd == "ARM") {
+    Serial.println("[ACTION] ARM");
     if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
       isArmed = true;
       xSemaphoreGive(armMutex);
     }
     sendAlert("System Armed");
 
-  } else if (resp.indexOf("\"command\":\"DISARM\"") >= 0) {
-    Serial.println("[MQTT] DISARM received");
+  } else if (cmd == "DISARM") {
+    Serial.println("[ACTION] DISARM");
     if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
       isArmed = false;
       xSemaphoreGive(armMutex);
     }
     sendAlert("System Disarmed");
 
-  } else if (resp.indexOf("\"command\":\"BUZZ\"") >= 0) {
-    Serial.println("[MQTT] BUZZ received");
+  } else if (cmd == "BUZZ") {
+    Serial.println("[ACTION] BUZZ");
     longAlarm();
     sendAlert("BUZZ Executed");
 
-  } else if (resp.indexOf("\"command\":\"REQUEST_POSITION\"") >= 0) {
-    Serial.println("[MQTT] REQUEST_POSITION received");
+  } else if (cmd == "REQUEST_POSITION") {
+    Serial.println("[ACTION] REQUEST_POSITION");
     sendAlert("Posisi Diminta");
+
+  } else {
+    Serial.print("[MQTT] Unknown command: ");
+    Serial.println(cmd);
   }
 }
 
