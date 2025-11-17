@@ -919,7 +919,7 @@ def dashboard():
                     div.appendChild(coords);
                     alertsDiv.appendChild(div);
                 }
-                log(`Alerts refreshed for ${deviceId} (total: ${data.length})`);
+                log(`Alerts refreshed for ${deviceId}`);
             } catch (e) {
                 document.getElementById('alerts').textContent = 'Error loading alerts';
                 log('Error refreshing alerts: ' + e);
