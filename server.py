@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 import uuid
 import hashlib
@@ -84,7 +84,7 @@ class Alert(Base):
     status = Column(String, nullable=False)
     lat = Column(Float, nullable=True)
     lon = Column(Float, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(hours=7))
 
     device = relationship("Device", back_populates="alerts")
 
@@ -370,7 +370,7 @@ def receive_alert(payload: AlertIn, db: Session = Depends(get_db)):
         db.add(device)
 
     # Always update current state
-    device.last_seen = datetime.utcnow()
+    device.last_seen = datetime.utcnow() + timedelta(hours=7)
     device.last_status = payload.status
     device.last_lat = payload.lat
     device.last_lon = payload.lon
@@ -383,7 +383,7 @@ def receive_alert(payload: AlertIn, db: Session = Depends(get_db)):
             status=payload.status,
             lat=payload.lat,
             lon=payload.lon,
-            created_at=datetime.utcnow(),
+            created_at=datetime.utcnow() + timedelta(hours=7),
         )
         db.add(alert)
         db.commit()
@@ -482,7 +482,7 @@ def device_status(device_id: str, db: Session = Depends(get_db)):
     if not device.last_seen:
         return {"device_id": device_id, "online": False, "last_seen": None}
 
-    diff = (datetime.utcnow() - device.last_seen).total_seconds()
+    diff = ((datetime.utcnow() + timedelta(hours=7)) - device.last_seen).total_seconds()
     online = diff <= ONLINE_THRESHOLD_SECONDS
 
     return {
@@ -509,7 +509,7 @@ def current_status(device_id: str, db: Session = Depends(get_db)):
             "lon": None,
         }
 
-    diff = (datetime.utcnow() - device.last_seen).total_seconds()
+    diff = ((datetime.utcnow() + timedelta(hours=7)) - device.last_seen).total_seconds()
     online = diff < ONLINE_THRESHOLD_SECONDS
 
     return {
