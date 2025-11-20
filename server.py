@@ -19,7 +19,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # Configuration
 # =========================
 
-ONLINE_THRESHOLD_SECONDS = 20  # Device is considered online if seen within this many seconds
+ONLINE_THRESHOLD_SECONDS = 25  # Device is considered online if seen within this many seconds
 
 IMPORTANT_EVENTS = {
     "Gerakan Terdeteksi (Button)",    # movement from button
