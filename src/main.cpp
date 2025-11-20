@@ -5,6 +5,9 @@
 #include <HardwareSerial.h>
 #include <PubSubClient.h>   // MQTT library
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // ====== MIDI NOTES ======
 #define ARRAY_LEN(array) (sizeof(array) / sizeof(array[0]))
@@ -68,10 +71,19 @@ const int buttonPin = 4;
 const int buzzerPin = 5;
 const int gpsRxPin = 16;
 const int gpsTxPin = 17;
+const int sdaPin = 21;  // I2C SDA for MPU6500
+const int sclPin = 22;  // I2C SCL for MPU6500
 
 // GPS
 HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
+
+// MPU6500 (using MPU6050 library)
+Adafruit_MPU6050 mpu;
+bool mpuInitialized = false;
+float accelThreshold = 10.5;  // m/s^2 threshold for motion detection
+unsigned long lastMotionTime = 0;
+const unsigned long motionCooldown = 2000; // 2 seconds between motion detections
 
 // [NEW] FreeRTOS handles for multi-core coordination
 TaskHandle_t networkTaskHandle; // Handle for our Core 0 task
@@ -175,6 +187,54 @@ void sendAlert(const String& status) {
     Serial.print("[ALERT] Response: ");
     Serial.println(resp);
   }
+  http.end();
+}
+
+// Pull current armed_state from backend and sync isArmed
+void syncArmStateFromServer() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[SYNC] WiFi not connected, cannot sync arm state");
+    return;
+  }
+
+  String url = String(serverBase) + "/devices/" + deviceId + "/current";
+  HTTPClient http;
+  http.begin(url);
+  Serial.print("[SYNC] GET ");
+  Serial.println(url);
+
+  int code = http.GET();
+  Serial.print("[SYNC] HTTP status: ");
+  Serial.println(code);
+
+  if (code > 0) {
+    String body = http.getString();
+    Serial.print("[SYNC] Body: ");
+    Serial.println(body);
+
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+      Serial.print("[SYNC] JSON parse failed: ");
+      Serial.println(err.f_str());
+    } else {
+      const char* state = doc["armed_state"];
+      if (state) {
+        bool newIsArmed = (String(state) == "armed");
+        if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
+          isArmed = newIsArmed;
+          xSemaphoreGive(armMutex);
+        }
+        Serial.print("[SYNC] Armed state from server: ");
+        Serial.println(newIsArmed ? "ARMED" : "DISARMED");
+      } else {
+        Serial.println("[SYNC] No 'armed_state' in JSON");
+      }
+    }
+  } else {
+    Serial.println("[SYNC] HTTP GET failed");
+  }
+
   http.end();
 }
 
@@ -335,6 +395,31 @@ void setup() {
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
 
+  // Initialize I2C for MPU6500
+  Wire.begin(sdaPin, sclPin);
+  Serial.println("[BOOT] Initializing MPU6500...");
+  
+  if (mpu.begin()) {
+    Serial.println("[BOOT] MPU6500 initialized successfully");
+    
+    // Configure MPU6500
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    
+    Serial.print("[BOOT] Accelerometer range: ");
+    Serial.println("+-8G");
+    Serial.print("[BOOT] Gyro range: ");
+    Serial.println("+-500 deg/s");
+    Serial.print("[BOOT] Filter bandwidth: ");
+    Serial.println("21 Hz");
+    
+    mpuInitialized = true;
+  } else {
+    Serial.println("[BOOT] Failed to find MPU6500 chip - continuing without it");
+    mpuInitialized = false;
+  }
+
   // [NEW] Initialize the mutexes and queue
   armMutex = xSemaphoreCreateMutex();
   buzzerMutex = xSemaphoreCreateMutex();
@@ -357,6 +442,9 @@ void setup() {
   Serial.println("\n[BOOT] WiFi connected");
   Serial.print("[BOOT] ESP IP: ");
   Serial.println(WiFi.localIP());
+
+  // NEW: sync initial armed/disarmed state from backend
+  syncArmStateFromServer();
 
   // [MQTT] Initialize MQTT
   mqttCmdTopic = "motor/" + deviceId + "/cmd";
@@ -431,12 +519,52 @@ void loop() {
       
       // [NEW] Instead of calling sendAlert(), we send a message to the queue
       AlertMessage alertMsg;
-      strncpy(alertMsg.message, "Gerakan Terdeteksi", ALERT_MSG_SIZE - 1);
+      strncpy(alertMsg.message, "Gerakan Terdeteksi (Button)", ALERT_MSG_SIZE - 1);
       alertMsg.message[ALERT_MSG_SIZE - 1] = '\0';
       xQueueSend(alertQueue, &alertMsg, portMAX_DELAY);
 
     } else {
       Serial.println("[EVENT] System disarmed -> ignoring movement");
+    }
+  }
+
+  // 4. Check MPU6500 for motion (non-blocking)
+  if (mpuInitialized && (now - lastMotionTime > motionCooldown)) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    
+    // Calculate total acceleration (subtract gravity for motion detection)
+    float accelMagnitude = sqrt(a.acceleration.x * a.acceleration.x + 
+                                 a.acceleration.y * a.acceleration.y + 
+                                 a.acceleration.z * a.acceleration.z);
+    
+    // Check if motion exceeds threshold (normal is ~9.8 m/s^2 due to gravity)
+    float deviation = abs(accelMagnitude - 9.8);
+    
+    if (deviation > accelThreshold) {
+      lastMotionTime = now;
+      Serial.print("[MPU6500] Motion detected! Accel deviation: ");
+      Serial.print(deviation);
+      Serial.println(" m/s^2");
+      
+      // Check if system is armed
+      bool currentlyArmed = false;
+      if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
+        currentlyArmed = isArmed;
+        xSemaphoreGive(armMutex);
+      }
+      
+      if (currentlyArmed) {
+        Serial.println("[EVENT] System armed -> triggering alarm + queuing alert");
+        longAlarm();
+        
+        AlertMessage alertMsg;
+        strncpy(alertMsg.message, "Gerakan Terdeteksi (MPU6500)", ALERT_MSG_SIZE - 1);
+        alertMsg.message[ALERT_MSG_SIZE - 1] = '\0';
+        xQueueSend(alertQueue, &alertMsg, portMAX_DELAY);
+      } else {
+        Serial.println("[EVENT] System disarmed -> ignoring MPU motion");
+      }
     }
   }
 

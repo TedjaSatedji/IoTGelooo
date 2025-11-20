@@ -72,6 +72,9 @@ class Device(Base):
     last_lat = Column(Float, nullable=True)
     last_lon = Column(Float, nullable=True)
 
+    # NEW: persistent armed/disarmed state
+    armed_state = Column(String, nullable=False, default="disarmed")
+
     owner = relationship("User", back_populates="devices")
     alerts = relationship("Alert", back_populates="device")
 
@@ -375,6 +378,12 @@ def receive_alert(payload: AlertIn, db: Session = Depends(get_db)):
     device.last_lat = payload.lat
     device.last_lon = payload.lon
 
+    # Update armed_state based on status messages
+    if payload.status == "System Armed":
+        device.armed_state = "armed"
+    elif payload.status == "System Disarmed":
+        device.armed_state = "disarmed"
+
     # Only store meaningful events
     alert_id = None
     if payload.status in IMPORTANT_EVENTS:
@@ -507,6 +516,7 @@ def current_status(device_id: str, db: Session = Depends(get_db)):
             "last_status": None,
             "lat": None,
             "lon": None,
+            "armed_state": device.armed_state,  # NEW
         }
 
     diff = ((datetime.utcnow() + timedelta(hours=7)) - device.last_seen).total_seconds()
@@ -519,6 +529,7 @@ def current_status(device_id: str, db: Session = Depends(get_db)):
         "last_status": device.last_status,
         "lat": device.last_lat,
         "lon": device.last_lon,
+        "armed_state": device.armed_state,      # NEW
     }
 
 
