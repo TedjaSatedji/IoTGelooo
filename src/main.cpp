@@ -67,7 +67,7 @@ String mqttCmdTopic;  // will be "motor/<deviceId>/cmd"
 
 // Pins
 const int buttonPin = 4;
-const int buzzerPin = 5;
+const int buzzerPin = 13;
 const int gpsRxPin = 16;
 const int gpsTxPin = 17;
 const int sdaPin = 21;  // I2C SDA for MPU6500
@@ -81,113 +81,134 @@ TinyGPSPlus gps;
 bfs::Mpu6500 mpu;
 bool mpuInitialized = false;
 int mpuFailCount = 0;
-float accelThreshold = 5.5;  // m/s^2 threshold for motion detection
+float accelThreshold = 1.5;  // m/s^2 threshold for motion detection
 unsigned long lastMotionTime = 0;
 const unsigned long motionCooldown = 2000; // 2 seconds between motion detections
+int motionCount = 0;  // Motion detections within time window
+unsigned long motionWindowStart = 0;  // Start of detection window
+const unsigned long motionWindowTime = 500;  // 500ms window
+const int motionRequiredCount = 2;  // Require 2 detections within window
 
-// [NEW] FreeRTOS handles for multi-core coordination
-TaskHandle_t networkTaskHandle; // Handle for our Core 0 task
-QueueHandle_t alertQueue;       // Queue to send alert messages from Core 1 to Core 0
-SemaphoreHandle_t armMutex;     // Mutex to protect the 'isArmed' variable
-SemaphoreHandle_t buzzerMutex;  // Mutex to protect the buzzer (so cores don't fight for it)
+// State
+bool isArmed = true;
 
-// [FIX] Use fixed-size char array for queue messages instead of String
-#define ALERT_MSG_SIZE 64
-typedef struct {
-  char message[ALERT_MSG_SIZE];
-} AlertMessage;
-
-// [NEW] 'volatile' keyword is critical for variables shared between cores
-volatile bool isArmed = true;
-
-// [NEW] Non-blocking timer for the button debounce
+// Timers
 unsigned long lastButtonPress = 0;
 const unsigned long buttonDebounceTime = 700; // ms
+unsigned long lastHeartbeat = 0;
+const unsigned long heartbeatInterval = 15000; // 15 seconds
+unsigned long lastAlarmTime = 0;  // Track when alarm finished
+const unsigned long alarmRecoveryTime = 1000;  // Wait 1 second after buzzer before reading MPU
+
+// Background HTTP task
+QueueHandle_t alertQueue;
+TaskHandle_t httpTaskHandle;
+
+#define ALERT_MSG_SIZE 64
+struct AlertMessage {
+  char status[ALERT_MSG_SIZE];
+  double lat;
+  double lon;
+};
 
 // ===============================================
-// BUZZER FUNCTIONS (Now with Mutex)
+// BUZZER FUNCTIONS
 // ===============================================
 
 void playMidi(int pin, const int notes[][3], size_t len) {
-  // [NEW] Wait to get exclusive access to the buzzer
-  if (xSemaphoreTake(buzzerMutex, portMAX_DELAY) == pdTRUE) {
-    for (int i = 0; i < len; i++) {
-      tone(pin, notes[i][0]);
-      delay(notes[i][1]); // delay() is okay here, it's inside a protected task
-      noTone(pin);
-      delay(notes[i][2]);
-    }
-    // [NEW] Release the buzzer for other tasks
-    xSemaphoreGive(buzzerMutex);
+  for (int i = 0; i < len; i++) {
+    tone(pin, notes[i][0]);
+    delay(notes[i][1]);
+    noTone(pin);
+    delay(notes[i][2]);
   }
 }
 
 void beepBuzzer(int times, int onMs, int offMs) {
-  if (xSemaphoreTake(buzzerMutex, portMAX_DELAY) == pdTRUE) {
-    pinMode(buzzerPin, OUTPUT);
-    for (int i = 0; i < times; i++) {
-      digitalWrite(buzzerPin, HIGH);
-      delay(onMs);
-      digitalWrite(buzzerPin, LOW);
-      delay(offMs);
-    }
-    xSemaphoreGive(buzzerMutex);
+  pinMode(buzzerPin, OUTPUT);
+  for (int i = 0; i < times; i++) {
+    digitalWrite(buzzerPin, HIGH);
+    delay(onMs);
+    digitalWrite(buzzerPin, LOW);
+    delay(offMs);
   }
 }
 
 void longAlarm() {
-  beepBuzzer(5, 200, 100); // This function now automatically uses the mutex
+  beepBuzzer(5, 200, 100);
 }
 
 // ===============================================
-// NETWORKING FUNCTIONS (Will run on Core 0)
+// NETWORKING FUNCTIONS
 // ===============================================
 
-// [NEW] This function is now ONLY called by the network task on Core 0
-void sendAlert(const String& status) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[ALERT] WiFi not connected, cannot send");
-    return;
-  }
-
-  double lat = 0;
-  double lon = 0;
+// Queue an alert to be sent in the background (non-blocking)
+void queueAlert(const String& status) {
+  AlertMessage msg;
+  strncpy(msg.status, status.c_str(), ALERT_MSG_SIZE - 1);
+  msg.status[ALERT_MSG_SIZE - 1] = '\0';
   
-  // No need for a mutex on GPS, Core 1 only writes to it, 
-  // Core 0 only reads. The values might be *slightly* old, but won't crash.
   if (gps.location.isValid()) {
-    lat = gps.location.lat();
-    lon = gps.location.lng();
+    msg.lat = gps.location.lat();
+    msg.lon = gps.location.lng();
+    Serial.print("[GPS] Using position: ");
+    Serial.print(msg.lat, 6);
+    Serial.print(", ");
+    Serial.println(msg.lon, 6);
   } else {
-    Serial.println("[ALERT] GPS not valid, sending lat=0, lon=0");
+    msg.lat = 0;
+    msg.lon = 0;
+    Serial.println("[GPS] No valid fix, using 0,0");
   }
-
-  String url = String(serverBase) + "/api/alert";
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-
-  String payload = "{";
-  payload += "\"device_id\":\"" + deviceId + "\",";
-  payload += "\"status\":\"" + status + "\",";
-  payload += "\"lat\":" + String(lat, 6) + ",";
-  payload += "\"lon\":" + String(lon, 6);
-  payload += "}";
-
-  Serial.print("[ALERT] Sending payload: ");
-  Serial.println(payload);
-
-  // [BLOCKING] This POST call now blocks Core 0, which is fine!
-  int code = http.POST(payload);
-  Serial.print("[ALERT] HTTP status: ");
-  Serial.println(code);
-
-  if (code > 0) {
-    String resp = http.getString();
-    Serial.print("[ALERT] Response: ");
-    Serial.println(resp);
+  
+  if (xQueueSend(alertQueue, &msg, 0) == pdTRUE) {
+    Serial.print("[ALERT] Queued: ");
+    Serial.println(status);
+  } else {
+    Serial.println("[ALERT] Queue full, alert dropped!");
   }
-  http.end();
+}
+
+// Background task that sends HTTP alerts without blocking main loop
+void httpTask(void *pvParameters) {
+  AlertMessage msg;
+  
+  for (;;) {
+    // Wait for alert messages in the queue
+    if (xQueueReceive(alertQueue, &msg, portMAX_DELAY) == pdTRUE) {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[HTTP] WiFi not connected, skipping alert");
+        continue;
+      }
+      
+      String url = String(serverBase) + "/api/alert";
+      HTTPClient http;
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+      http.setTimeout(3000); // 3 second timeout
+
+      String payload = "{";
+      payload += "\"device_id\":\"" + deviceId + "\",";
+      payload += "\"status\":\"" + String(msg.status) + "\",";
+      payload += "\"lat\":" + String(msg.lat, 6) + ",";
+      payload += "\"lon\":" + String(msg.lon, 6);
+      payload += "}";
+
+      Serial.print("[HTTP] Sending: ");
+      Serial.println(payload);
+
+      int code = http.POST(payload);
+      Serial.print("[HTTP] Status: ");
+      Serial.println(code);
+
+      if (code > 0) {
+        String resp = http.getString();
+        Serial.print("[HTTP] Response: ");
+        Serial.println(resp);
+      }
+      http.end();
+    }
+  }
 }
 
 // Pull current armed_state from backend and sync isArmed
@@ -220,13 +241,9 @@ void syncArmStateFromServer() {
     } else {
       const char* state = doc["armed_state"];
       if (state) {
-        bool newIsArmed = (String(state) == "armed");
-        if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-          isArmed = newIsArmed;
-          xSemaphoreGive(armMutex);
-        }
+        isArmed = (String(state) == "armed");
         Serial.print("[SYNC] Armed state from server: ");
-        Serial.println(newIsArmed ? "ARMED" : "DISARMED");
+        Serial.println(isArmed ? "ARMED" : "DISARMED");
       } else {
         Serial.println("[SYNC] No 'armed_state' in JSON");
       }
@@ -263,28 +280,22 @@ void handleCommandString(const String &resp) {
 
   if (cmd == "ARM") {
     Serial.println("[ACTION] ARM");
-    if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-      isArmed = true;
-      xSemaphoreGive(armMutex);
-    }
-    sendAlert("System Armed");
+    isArmed = true;
+    queueAlert("System Armed");
 
   } else if (cmd == "DISARM") {
     Serial.println("[ACTION] DISARM");
-    if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-      isArmed = false;
-      xSemaphoreGive(armMutex);
-    }
-    sendAlert("System Disarmed");
+    isArmed = false;
+    queueAlert("System Disarmed");
 
   } else if (cmd == "BUZZ") {
     Serial.println("[ACTION] BUZZ");
     longAlarm();
-    sendAlert("BUZZ Executed");
+    queueAlert("BUZZ Executed");
 
   } else if (cmd == "REQUEST_POSITION") {
     Serial.println("[ACTION] REQUEST_POSITION");
-    sendAlert("Posisi Diminta");
+    queueAlert("Posisi Diminta");
 
   } else {
     Serial.print("[MQTT] Unknown command: ");
@@ -310,16 +321,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void mqttReconnect() {
-  // Loop until reconnected
   while (!mqttClient.connected()) {
     Serial.print("[MQTT] Attempting connection...");
-    // Client ID can be anything unique
     String clientId = "motor-esp32-";
     clientId += deviceId;
 
     if (mqttClient.connect(clientId.c_str())) {
       Serial.println("connected");
-      // Subscribe to command topic
       mqttClient.subscribe(mqttCmdTopic.c_str());
       Serial.print("[MQTT] Subscribed to ");
       Serial.println(mqttCmdTopic);
@@ -327,64 +335,14 @@ void mqttReconnect() {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
       Serial.println(" try again in 5 seconds");
-      vTaskDelay(5000 / portTICK_PERIOD_MS);
+      delay(5000);
     }
   }
 }
 
-
-// [NEW] This is the main function for our network task on Core 0
-void networkTask(void *pvParameters) {
-  Serial.println("[TASK] Network task started on Core 0");
-
-  unsigned long lastHeartbeat = 0;
-  const unsigned long heartbeatInterval = 15000;
-
-  // This is the infinite loop for Core 0
-  for (;;) {
-    // 1. Make sure WiFi is connected
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[TASK] WiFi disconnected. Reconnecting...");
-      WiFi.reconnect();
-      vTaskDelay(5000 / portTICK_PERIOD_MS); // Wait 5s before retrying
-      continue; // Skip the rest of the loop
-    }
-
-    // Ensure MQTT is connected
-    if (!mqttClient.connected()) {
-      mqttReconnect();
-    }
-    mqttClient.loop();  // process incoming MQTT packets
-
-    // 2. Check for alerts from the queue
-    AlertMessage alertMessage;
-    // [NEW] Check the queue. '0' timeout means it returns instantly
-    if (xQueueReceive(alertQueue, &alertMessage, (TickType_t)0) == pdTRUE) {
-      Serial.print("[TASK] Received alert from queue: ");
-      Serial.println(alertMessage.message);
-      sendAlert(alertMessage.message); // This is a blocking call on Core 0
-    }
-
-    unsigned long now = millis();
-
-    // 3. Send heartbeat (non-blocking timer)
-    if (now - lastHeartbeat >= heartbeatInterval) {
-      lastHeartbeat = now;
-      Serial.println("[TASK] Queuing heartbeat");
-      // [NEW] Don't send directly, add to the queue to be processed
-      AlertMessage hbMsg;
-      strncpy(hbMsg.message, "Heartbeat", ALERT_MSG_SIZE - 1);
-      hbMsg.message[ALERT_MSG_SIZE - 1] = '\0';
-      xQueueSend(alertQueue, &hbMsg, 0);
-    }
-
-    // [NEW] Give the scheduler a tiny break
-    vTaskDelay(10 / portTICK_PERIOD_MS); 
-  }
-}
 
 // ===============================================
-// SETUP (Runs on Core 1)
+// SETUP
 // ===============================================
 void setup() {
   Serial.begin(115200);
@@ -397,7 +355,8 @@ void setup() {
 
   // Initialize I2C for MPU6500
   Wire.begin(sdaPin, sclPin);
-  Wire.setClock(100000);  // 100kHz I2C (same as the working minimal test)
+  Wire.setClock(100000);  // 100kHz I2C for better noise immunity
+  Wire.setTimeOut(1000);  // 1 second timeout to prevent freezing
   Serial.println("[BOOT] Initializing MPU6500...");
   
   // Configure I2C bus and address (0x68 is primary address)
@@ -406,9 +365,9 @@ void setup() {
   if (mpu.Begin()) {
     Serial.println("[BOOT] MPU6500 initialized successfully");
     
-    // Set sample rate divider (19 = 50Hz with 1kHz base rate)
-    if (mpu.ConfigSrd(19)) {
-      Serial.println("[BOOT] MPU6500 sample rate configured (50Hz)");
+    // Set sample rate divider (99 = 10Hz with 1kHz base rate)
+    if (mpu.ConfigSrd(99)) {
+      Serial.println("[BOOT] MPU6500 sample rate configured (10Hz)");
     } else {
       Serial.println("[BOOT] Warning: Failed to configure sample rate");
     }
@@ -418,11 +377,6 @@ void setup() {
     Serial.println("[BOOT] Failed to initialize MPU6500 - continuing without it");
     mpuInitialized = false;
   }
-
-  // [NEW] Initialize the mutexes and queue
-  armMutex = xSemaphoreCreateMutex();
-  buzzerMutex = xSemaphoreCreateMutex();
-  alertQueue = xQueueCreate(10, sizeof(AlertMessage)); // Queue for 10 AlertMessage structs
 
   Serial.println("[BOOT] Playing startup melody...");
   playMidi(buzzerPin, midi1, ARRAY_LEN(midi1));
@@ -451,28 +405,26 @@ void setup() {
   mqttClient.setCallback(mqttCallback);
   Serial.println("[BOOT] MQTT configured");
 
-  // [NEW] Send the boot message to the queue
-  AlertMessage bootMsg;
-  strncpy(bootMsg.message, "Device Booted", ALERT_MSG_SIZE - 1);
-  bootMsg.message[ALERT_MSG_SIZE - 1] = '\0';
-  xQueueSend(alertQueue, &bootMsg, 0);
-
-  // [NEW] Create the network task and pin it to Core 0
+  // Create background HTTP task
+  alertQueue = xQueueCreate(10, sizeof(AlertMessage));
   xTaskCreatePinnedToCore(
-    networkTask,       // Function to run
-    "NetworkTask",     // Name (for debugging)
-    10000,             // Stack size (networking needs a lot)
-    NULL,              // Task input parameters (none)
-    1,                 // Priority (1 is good)
-    &networkTaskHandle, // Task handle
-    0                  // Pin to Core 0 (Core 1 is default for Arduino)
+    httpTask,
+    "HTTPTask",
+    8192,
+    NULL,
+    1,
+    &httpTaskHandle,
+    0  // Run on Core 0
   );
+  Serial.println("[BOOT] Background HTTP task started");
+
+  queueAlert("Device Booted");
   
-  Serial.println("[BOOT] Setup complete. Main loop (Core 1) starting.");
+  Serial.println("[BOOT] Setup complete.");
 }
 
 // ===============================================
-// LOOP (Runs on Core 1 - Now super fast!)
+// LOOP
 // ===============================================
 void loop() {
   // 1. Always feed the GPS parser
@@ -480,58 +432,43 @@ void loop() {
     gps.encode(gpsSerial.read());
   }
 
-  // 2. Print GPS data (non-blocking)
-  static unsigned long lastGpsPrint = 0;
+  // 2. Handle MQTT
+  if (!mqttClient.connected()) {
+    mqttReconnect();
+  }
+  mqttClient.loop();
+
   unsigned long now = millis();
-  if (now - lastGpsPrint > 2000) {
-    lastGpsPrint = now;
-    if (gps.location.isValid()) {
-      Serial.print("[GPS] Lat: ");
-      Serial.print(gps.location.lat(), 6);
-      Serial.print(" Lon: ");
-      Serial.print(gps.location.lng(), 6);
-      Serial.print(" Sat: ");
-      Serial.print(gps.satellites.value());
-      Serial.print(" HDOP: ");
-      Serial.println(gps.hdop.value());
-    } else {
-      Serial.println("[GPS] No valid fix yet");
-    }
+
+  // 3. Send heartbeat
+  if (now - lastHeartbeat >= heartbeatInterval) {
+    lastHeartbeat = now;
+    queueAlert("Heartbeat");
   }
 
-  // 3. Check the button (non-blocking)
-  // [NEW] Replaced delay(700) with a non-blocking millis() check
+  // 4. Check the button (non-blocking)
   if (digitalRead(buttonPin) == LOW && (now - lastButtonPress > buttonDebounceTime)) {
-    lastButtonPress = now; // Reset the timer
+    lastButtonPress = now;
     Serial.println("[EVENT] Button pressed -> movement detected");
 
-    // [NEW] Safely read the shared variable
-    bool currentlyArmed = false;
-    if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-      currentlyArmed = isArmed; // Make a local copy
-      xSemaphoreGive(armMutex);
-    }
-
-    if (currentlyArmed) {
-      Serial.println("[EVENT] System armed -> triggering alarm + queuing alert");
-      longAlarm(); // This is safe, it uses the buzzer mutex
-      
-      // [NEW] Instead of calling sendAlert(), we send a message to the queue
-      AlertMessage alertMsg;
-      strncpy(alertMsg.message, "Gerakan Terdeteksi (Button)", ALERT_MSG_SIZE - 1);
-      alertMsg.message[ALERT_MSG_SIZE - 1] = '\0';
-      xQueueSend(alertQueue, &alertMsg, portMAX_DELAY);
-
+    if (isArmed) {
+      Serial.println("[EVENT] System armed -> triggering alarm + sending alert");
+      longAlarm();
+      lastAlarmTime = millis();  // Record when alarm finished
+      queueAlert("Gerakan Terdeteksi (Button)");
     } else {
       Serial.println("[EVENT] System disarmed -> ignoring movement");
     }
   }
 
-  // 4. Check MPU6500 for motion (non-blocking)
+  // 5. Check MPU6500 for motion (non-blocking)
   static unsigned long lastMpuReadTime = 0;
-  const unsigned long mpuReadInterval = 20;  // ~50Hz, like the minimal test
+  const unsigned long mpuReadInterval = 100;  // 10Hz
 
-  if (mpuInitialized &&
+  // Skip MPU reads during post-alarm recovery period
+  bool systemStabilizing = (now - lastAlarmTime < alarmRecoveryTime);
+
+  if (mpuInitialized && !systemStabilizing &&
       (now - lastMotionTime > motionCooldown) &&
       (now - lastMpuReadTime >= mpuReadInterval)) {
 
@@ -543,19 +480,20 @@ void loop() {
       Serial.print("[MPU] Read failed, count=");
       Serial.println(mpuFailCount);
 
-      // If too many consecutive failures, try to recover the bus + sensor
-      if (mpuFailCount > 10) {
-        Serial.println("[MPU] Too many I2C errors, resetting I2C + MPU");
+      // Aggressive recovery at lower threshold
+      if (mpuFailCount > 5) {
+        Serial.println("[MPU] Resetting I2C Bus...");
 
         Wire.end();
-        delay(10);
+        delay(50);
         Wire.begin(sdaPin, sclPin);
         Wire.setClock(100000);
+        Wire.setTimeOut(1000);
 
         mpu.Config(&Wire, bfs::Mpu6500::I2C_ADDR_PRIM);
         if (mpu.Begin()) {
           Serial.println("[MPU] Re-init OK");
-          if (mpu.ConfigSrd(19)) {
+          if (mpu.ConfigSrd(99)) {
             Serial.println("[MPU] SRD reset OK");
           } else {
             Serial.println("[MPU] SRD reset FAILED");
@@ -584,35 +522,44 @@ void loop() {
     float deviation = fabs(accelMagnitude - 9.81f);
 
     if (deviation > accelThreshold) {
-      lastMotionTime = now;
-      Serial.print("[MPU6500] Motion detected! Accel deviation: ");
-      Serial.print(deviation);
-      Serial.println(" m/s^2");
-      
-      // Check if system is armed
-      bool currentlyArmed = false;
-      if (xSemaphoreTake(armMutex, portMAX_DELAY) == pdTRUE) {
-        currentlyArmed = isArmed;
-        xSemaphoreGive(armMutex);
-      }
-      
-      if (currentlyArmed) {
-        Serial.println("[EVENT] System armed -> triggering alarm + queuing alert");
-        longAlarm();
-        
-        AlertMessage alertMsg;
-        strncpy(alertMsg.message, "Gerakan Terdeteksi (MPU6500)", ALERT_MSG_SIZE - 1);
-        alertMsg.message[ALERT_MSG_SIZE - 1] = '\0';
-        xQueueSend(alertQueue, &alertMsg, portMAX_DELAY);
+      // Start new window if this is first detection or window expired
+      if (motionCount == 0 || (now - motionWindowStart > motionWindowTime)) {
+        motionWindowStart = now;
+        motionCount = 1;
+        Serial.print("[MPU6500] Motion #1 detected! Deviation: ");
+        Serial.println(deviation);
       } else {
-        Serial.println("[EVENT] System disarmed -> ignoring MPU motion");
+        // Within the window, increment count
+        motionCount++;
+        Serial.print("[MPU6500] Motion #");
+        Serial.print(motionCount);
+        Serial.print(" detected! Deviation: ");
+        Serial.print(deviation);
+        Serial.print(" m/s^2 (within ");
+        Serial.print(now - motionWindowStart);
+        Serial.println("ms window)");
+        
+        // Trigger alarm if we hit the threshold within the window
+        if (motionCount >= motionRequiredCount) {
+          lastMotionTime = now;
+          motionCount = 0;  // Reset counter
+          
+          if (isArmed) {
+            Serial.println("[EVENT] System armed -> triggering alarm + sending alert");
+            longAlarm();
+            lastAlarmTime = millis();  // Record when alarm finished
+            queueAlert("Gerakan Terdeteksi (MPU6500)");
+          } else {
+            Serial.println("[EVENT] System disarmed -> ignoring MPU motion");
+          }
+        }
+      }
+    } else {
+      // Reset if window expires without reaching threshold
+      if (motionCount > 0 && (now - motionWindowStart > motionWindowTime)) {
+        Serial.println("[MPU6500] Window expired, resetting counter");
+        motionCount = 0;
       }
     }
   }
-
-  // [REMOVED]
-  // All networking (HTTP alerts + MQTT commands) is now on Core 0!
-  // No more HTTP polling for commands - everything comes via MQTT
-  
-  // This loop now finishes in microseconds.
 }
