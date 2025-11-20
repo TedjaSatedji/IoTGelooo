@@ -6,8 +6,7 @@
 #include <PubSubClient.h>   // MQTT library
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
+#include "mpu6500.h"
 
 // ====== MIDI NOTES ======
 #define ARRAY_LEN(array) (sizeof(array) / sizeof(array[0]))
@@ -78,10 +77,11 @@ const int sclPin = 22;  // I2C SCL for MPU6500
 HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
 
-// MPU6500 (using MPU6050 library)
-Adafruit_MPU6050 mpu;
+// MPU6500 (using invensense-imu library)
+bfs::Mpu6500 mpu;
 bool mpuInitialized = false;
-float accelThreshold = 10.5;  // m/s^2 threshold for motion detection
+int mpuFailCount = 0;
+float accelThreshold = 5.5;  // m/s^2 threshold for motion detection
 unsigned long lastMotionTime = 0;
 const unsigned long motionCooldown = 2000; // 2 seconds between motion detections
 
@@ -397,26 +397,25 @@ void setup() {
 
   // Initialize I2C for MPU6500
   Wire.begin(sdaPin, sclPin);
+  Wire.setClock(100000);  // 100kHz I2C (same as the working minimal test)
   Serial.println("[BOOT] Initializing MPU6500...");
   
-  if (mpu.begin()) {
+  // Configure I2C bus and address (0x68 is primary address)
+  mpu.Config(&Wire, bfs::Mpu6500::I2C_ADDR_PRIM);
+  
+  if (mpu.Begin()) {
     Serial.println("[BOOT] MPU6500 initialized successfully");
     
-    // Configure MPU6500
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    
-    Serial.print("[BOOT] Accelerometer range: ");
-    Serial.println("+-8G");
-    Serial.print("[BOOT] Gyro range: ");
-    Serial.println("+-500 deg/s");
-    Serial.print("[BOOT] Filter bandwidth: ");
-    Serial.println("21 Hz");
+    // Set sample rate divider (19 = 50Hz with 1kHz base rate)
+    if (mpu.ConfigSrd(19)) {
+      Serial.println("[BOOT] MPU6500 sample rate configured (50Hz)");
+    } else {
+      Serial.println("[BOOT] Warning: Failed to configure sample rate");
+    }
     
     mpuInitialized = true;
   } else {
-    Serial.println("[BOOT] Failed to find MPU6500 chip - continuing without it");
+    Serial.println("[BOOT] Failed to initialize MPU6500 - continuing without it");
     mpuInitialized = false;
   }
 
@@ -529,18 +528,61 @@ void loop() {
   }
 
   // 4. Check MPU6500 for motion (non-blocking)
-  if (mpuInitialized && (now - lastMotionTime > motionCooldown)) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    
-    // Calculate total acceleration (subtract gravity for motion detection)
-    float accelMagnitude = sqrt(a.acceleration.x * a.acceleration.x + 
-                                 a.acceleration.y * a.acceleration.y + 
-                                 a.acceleration.z * a.acceleration.z);
-    
-    // Check if motion exceeds threshold (normal is ~9.8 m/s^2 due to gravity)
-    float deviation = abs(accelMagnitude - 9.8);
-    
+  static unsigned long lastMpuReadTime = 0;
+  const unsigned long mpuReadInterval = 20;  // ~50Hz, like the minimal test
+
+  if (mpuInitialized &&
+      (now - lastMotionTime > motionCooldown) &&
+      (now - lastMpuReadTime >= mpuReadInterval)) {
+
+    lastMpuReadTime = now;
+
+    // Try reading from MPU
+    if (!mpu.Read()) {
+      mpuFailCount++;
+      Serial.print("[MPU] Read failed, count=");
+      Serial.println(mpuFailCount);
+
+      // If too many consecutive failures, try to recover the bus + sensor
+      if (mpuFailCount > 10) {
+        Serial.println("[MPU] Too many I2C errors, resetting I2C + MPU");
+
+        Wire.end();
+        delay(10);
+        Wire.begin(sdaPin, sclPin);
+        Wire.setClock(100000);
+
+        mpu.Config(&Wire, bfs::Mpu6500::I2C_ADDR_PRIM);
+        if (mpu.Begin()) {
+          Serial.println("[MPU] Re-init OK");
+          if (mpu.ConfigSrd(19)) {
+            Serial.println("[MPU] SRD reset OK");
+          } else {
+            Serial.println("[MPU] SRD reset FAILED");
+          }
+          mpuInitialized = true;
+          mpuFailCount = 0;
+        } else {
+          Serial.println("[MPU] Re-init FAILED, disabling MPU");
+          mpuInitialized = false;
+        }
+      }
+
+      // On any failed read, skip motion logic this loop
+      return;
+    }
+
+    // Successful read: reset fail counter and process motion
+    mpuFailCount = 0;
+
+    // Get acceleration values in m/s^2
+    float accel_x = mpu.accel_x_mps2();
+    float accel_y = mpu.accel_y_mps2();
+    float accel_z = mpu.accel_z_mps2();
+
+    float accelMagnitude = sqrt(accel_x * accel_x + accel_y * accel_y + accel_z * accel_z);
+    float deviation = fabs(accelMagnitude - 9.81f);
+
     if (deviation > accelThreshold) {
       lastMotionTime = now;
       Serial.print("[MPU6500] Motion detected! Accel deviation: ");

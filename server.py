@@ -22,11 +22,13 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 ONLINE_THRESHOLD_SECONDS = 20  # Device is considered online if seen within this many seconds
 
 IMPORTANT_EVENTS = {
-    "Gerakan Terdeteksi",   # movement
-    "Posisi Diminta",       # request position
+    "Gerakan Terdeteksi (Button)",    # movement from button
+    "Gerakan Terdeteksi (MPU6500)",   # movement from MPU sensor
+    "Posisi Diminta",                 # request position
     "System Armed",
     "System Disarmed",
     "Theft Warning",
+    "Device Booted",                  # device startup
 }
 
 MQTT_BROKER = "localhost"          # or your broker IP, e.g. "127.0.0.1"
