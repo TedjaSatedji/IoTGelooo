@@ -68,6 +68,7 @@ String mqttCmdTopic;  // will be "motor/<deviceId>/cmd"
 // Pins
 const int buttonPin = 4;
 const int buzzerPin = 13;
+const int ledPin = 2;     // Onboard LED
 const int gpsRxPin = 16;
 const int gpsTxPin = 17;
 const int sdaPin = 21;  // I2C SDA for MPU6500
@@ -97,17 +98,26 @@ unsigned long lastButtonPress = 0;
 const unsigned long buttonDebounceTime = 700; // ms
 unsigned long lastHeartbeat = 0;
 const unsigned long heartbeatInterval = 15000; // 15 seconds
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long mqttReconnectInterval = 5000; // 5 seconds between reconnect attempts
 
 // Background HTTP task
 QueueHandle_t alertQueue;
 TaskHandle_t httpTaskHandle;
 
 #define ALERT_MSG_SIZE 64
+#define MAX_PENDING_ALERTS 10  // Maximum alerts to queue when offline
 struct AlertMessage {
   char status[ALERT_MSG_SIZE];
   double lat;
   double lon;
 };
+
+// Persistent queue for offline alerts
+AlertMessage offlineAlertQueue[MAX_PENDING_ALERTS];
+int offlineQueueHead = 0;
+int offlineQueueTail = 0;
+int offlineQueueCount = 0;
 
 // ===============================================
 // BUZZER FUNCTIONS
@@ -167,15 +177,89 @@ void queueAlert(const String& status) {
   }
 }
 
+// Add alert to offline queue
+bool addToOfflineQueue(const AlertMessage &msg) {
+  if (offlineQueueCount >= MAX_PENDING_ALERTS) {
+    Serial.println("[OFFLINE] Queue full, dropping oldest alert");
+    // Drop oldest (overwrite at tail position)
+    offlineQueueTail = (offlineQueueTail + 1) % MAX_PENDING_ALERTS;
+    offlineQueueCount--;
+  }
+  
+  offlineAlertQueue[offlineQueueHead] = msg;
+  offlineQueueHead = (offlineQueueHead + 1) % MAX_PENDING_ALERTS;
+  offlineQueueCount++;
+  
+  Serial.print("[OFFLINE] Alert queued (total offline: ");
+  Serial.print(offlineQueueCount);
+  Serial.println(")");
+  return true;
+}
+
+// Get next alert from offline queue
+bool getFromOfflineQueue(AlertMessage &msg) {
+  if (offlineQueueCount == 0) {
+    return false;
+  }
+  
+  msg = offlineAlertQueue[offlineQueueTail];
+  offlineQueueTail = (offlineQueueTail + 1) % MAX_PENDING_ALERTS;
+  offlineQueueCount--;
+  return true;
+}
+
 // Background task that sends HTTP alerts without blocking main loop
 void httpTask(void *pvParameters) {
   AlertMessage msg;
   
   for (;;) {
-    // Wait for alert messages in the queue
-    if (xQueueReceive(alertQueue, &msg, portMAX_DELAY) == pdTRUE) {
+    // First, try to send any offline queued alerts if WiFi is connected
+    if (WiFi.status() == WL_CONNECTED && offlineQueueCount > 0) {
+      Serial.print("[OFFLINE] WiFi restored, processing ");
+      Serial.print(offlineQueueCount);
+      Serial.println(" queued alerts");
+      
+      AlertMessage offlineMsg;
+      while (getFromOfflineQueue(offlineMsg)) {
+        String url = String(serverBase) + "/api/alert";
+        HTTPClient http;
+        http.begin(url);
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(3000);
+
+        String payload = "{";
+        payload += "\"device_id\":\"" + deviceId + "\",";
+        payload += "\"status\":\"" + String(offlineMsg.status) + "\",";
+        payload += "\"lat\":" + String(offlineMsg.lat, 6) + ",";
+        payload += "\"lon\":" + String(offlineMsg.lon, 6);
+        payload += "}";
+
+        Serial.print("[OFFLINE] Sending queued: ");
+        Serial.println(payload);
+
+        int code = http.POST(payload);
+        if (code > 0) {
+          Serial.print("[OFFLINE] Sent successfully, status: ");
+          Serial.println(code);
+        } else {
+          Serial.print("[OFFLINE] Failed to send: ");
+          Serial.println(code);
+          // Put it back in queue if send failed
+          addToOfflineQueue(offlineMsg);
+          break;  // Stop processing offline queue if send fails
+        }
+        http.end();
+        
+        // Small delay between offline alert sends
+        delay(100);
+      }
+    }
+    
+    // Wait for new alert messages in the queue
+    if (xQueueReceive(alertQueue, &msg, 100 / portTICK_PERIOD_MS) == pdTRUE) {
       if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[HTTP] WiFi not connected, skipping alert");
+        Serial.println("[HTTP] WiFi not connected, adding to offline queue");
+        addToOfflineQueue(msg);
         continue;
       }
       
@@ -203,6 +287,10 @@ void httpTask(void *pvParameters) {
         String resp = http.getString();
         Serial.print("[HTTP] Response: ");
         Serial.println(resp);
+      } else {
+        // If send failed, add to offline queue for retry
+        Serial.println("[HTTP] Send failed, adding to offline queue");
+        addToOfflineQueue(msg);
       }
       http.end();
     }
@@ -279,11 +367,13 @@ void handleCommandString(const String &resp) {
   if (cmd == "ARM") {
     Serial.println("[ACTION] ARM");
     isArmed = true;
+    digitalWrite(ledPin, HIGH);  // LED on when armed
     queueAlert("System Armed");
 
   } else if (cmd == "DISARM") {
     Serial.println("[ACTION] DISARM");
     isArmed = false;
+    digitalWrite(ledPin, LOW);   // LED off when disarmed
     queueAlert("System Disarmed");
 
   } else if (cmd == "BUZZ") {
@@ -319,7 +409,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void mqttReconnect() {
-  while (!mqttClient.connected()) {
+  unsigned long now = millis();
+  
+  // Only attempt reconnection every 5 seconds (non-blocking)
+  if (now - lastMqttReconnectAttempt < mqttReconnectInterval) {
+    return;
+  }
+  
+  lastMqttReconnectAttempt = now;
+  
+  if (!mqttClient.connected()) {
     Serial.print("[MQTT] Attempting connection...");
     String clientId = "motor-esp32-";
     clientId += deviceId;
@@ -332,8 +431,7 @@ void mqttReconnect() {
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+      Serial.println(" will retry in 5 seconds");
     }
   }
 }
@@ -350,6 +448,9 @@ void setup() {
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
+  
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, HIGH);  // LED on (armed by default)
 
   // Initialize I2C for MPU6500
   Wire.begin(sdaPin, sclPin);
