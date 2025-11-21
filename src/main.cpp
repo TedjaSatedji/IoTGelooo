@@ -97,8 +97,6 @@ unsigned long lastButtonPress = 0;
 const unsigned long buttonDebounceTime = 700; // ms
 unsigned long lastHeartbeat = 0;
 const unsigned long heartbeatInterval = 15000; // 15 seconds
-unsigned long lastAlarmTime = 0;  // Track when alarm finished
-const unsigned long alarmRecoveryTime = 1000;  // Wait 1 second after buzzer before reading MPU
 
 // Background HTTP task
 QueueHandle_t alertQueue;
@@ -355,8 +353,7 @@ void setup() {
 
   // Initialize I2C for MPU6500
   Wire.begin(sdaPin, sclPin);
-  Wire.setClock(100000);  // 100kHz I2C for better noise immunity
-  Wire.setTimeOut(1000);  // 1 second timeout to prevent freezing
+  Wire.setClock(50000);  // 50kHz I2C
   Serial.println("[BOOT] Initializing MPU6500...");
   
   // Configure I2C bus and address (0x68 is primary address)
@@ -446,7 +443,7 @@ void loop() {
     queueAlert("Heartbeat");
   }
 
-  // 4. Check the button (non-blocking)
+  // 5. Check the button (non-blocking)
   if (digitalRead(buttonPin) == LOW && (now - lastButtonPress > buttonDebounceTime)) {
     lastButtonPress = now;
     Serial.println("[EVENT] Button pressed -> movement detected");
@@ -454,21 +451,17 @@ void loop() {
     if (isArmed) {
       Serial.println("[EVENT] System armed -> triggering alarm + sending alert");
       longAlarm();
-      lastAlarmTime = millis();  // Record when alarm finished
       queueAlert("Gerakan Terdeteksi (Button)");
     } else {
       Serial.println("[EVENT] System disarmed -> ignoring movement");
     }
   }
 
-  // 5. Check MPU6500 for motion (non-blocking)
+  // 6. Check MPU6500 for motion (non-blocking)
   static unsigned long lastMpuReadTime = 0;
   const unsigned long mpuReadInterval = 100;  // 10Hz
 
-  // Skip MPU reads during post-alarm recovery period
-  bool systemStabilizing = (now - lastAlarmTime < alarmRecoveryTime);
-
-  if (mpuInitialized && !systemStabilizing &&
+  if (mpuInitialized &&
       (now - lastMotionTime > motionCooldown) &&
       (now - lastMpuReadTime >= mpuReadInterval)) {
 
@@ -480,15 +473,14 @@ void loop() {
       Serial.print("[MPU] Read failed, count=");
       Serial.println(mpuFailCount);
 
-      // Aggressive recovery at lower threshold
-      if (mpuFailCount > 5) {
-        Serial.println("[MPU] Resetting I2C Bus...");
+      // If too many consecutive failures, try to recover the bus + sensor
+      if (mpuFailCount > 10) {
+        Serial.println("[MPU] Too many I2C errors, resetting I2C + MPU");
 
         Wire.end();
-        delay(50);
+        delay(10);
         Wire.begin(sdaPin, sclPin);
-        Wire.setClock(100000);
-        Wire.setTimeOut(1000);
+        Wire.setClock(50000);
 
         mpu.Config(&Wire, bfs::Mpu6500::I2C_ADDR_PRIM);
         if (mpu.Begin()) {
@@ -547,7 +539,6 @@ void loop() {
           if (isArmed) {
             Serial.println("[EVENT] System armed -> triggering alarm + sending alert");
             longAlarm();
-            lastAlarmTime = millis();  // Record when alarm finished
             queueAlert("Gerakan Terdeteksi (MPU6500)");
           } else {
             Serial.println("[EVENT] System disarmed -> ignoring MPU motion");
