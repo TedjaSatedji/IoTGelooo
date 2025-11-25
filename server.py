@@ -9,6 +9,13 @@ import hashlib
 import json
 import paho.mqtt.client as mqtt
 
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+# Load the key you downloaded
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred)
+
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float,
     DateTime, ForeignKey
@@ -59,6 +66,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     auth_token = Column(String, unique=True, index=True, nullable=True)
+    push_token = Column(String, nullable=True)  # Push notification token
 
     devices = relationship("Device", back_populates="owner")
 
@@ -138,6 +146,24 @@ def get_current_user(
 
 
 # =========================
+# Push Notification Helper
+# =========================
+
+def send_push_notification(token, title, body):
+    if not token:
+        return
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=token,
+        )
+        messaging.send(message)
+        print("✅ Notification sent!")
+    except Exception as e:
+        print(f"❌ Notification failed: {e}")
+
+
+# =========================
 # Pydantic models
 # =========================
 
@@ -191,6 +217,10 @@ class CommandIn(BaseModel):
     value: Optional[str] = None
 
 
+class TokenUpdate(BaseModel):
+    token: str
+
+
 # In-memory pending commands per device
 PENDING_COMMANDS: dict[str, Optional[dict]] = {}
 
@@ -223,6 +253,24 @@ def on_shutdown():
         print("[MQTT] Disconnected from broker")
     except Exception as e:
         print("[MQTT] Failed to disconnect:", e)
+
+
+# =========================
+# Push Notification Helper
+# =========================
+
+def send_push_notification(token, title, body):
+    if not token:
+        return
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=token,
+        )
+        messaging.send(message)
+        print("✅ Notification sent!")
+    except Exception as e:
+        print(f"❌ Notification failed: {e}")
 
 
 # =========================
@@ -270,6 +318,17 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
         email=user.email,
         auth_token=user.auth_token,
     )
+
+
+@app.post("/user/push-token")
+def update_push_token(
+    payload: TokenUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user.push_token = payload.token
+    db.commit()
+    return {"ok": True}
 
 
 # =========================
@@ -408,6 +467,16 @@ def receive_alert(payload: AlertIn, db: Session = Depends(get_db)):
             "lon": alert.lon,
             "created_at": alert.created_at.isoformat(),
         })
+
+        # Send push notification to device owner
+        if device.user_id:
+            owner = db.query(User).filter(User.id == device.user_id).first()
+            if owner and owner.push_token:
+                send_push_notification(
+                    owner.push_token,
+                    "🚨 Theft Alert!",
+                    f"{device.name}: {payload.status}"
+                )
     else:
         db.commit()
 
